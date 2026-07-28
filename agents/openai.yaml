@@ -1,0 +1,4 @@
+interface:
+  display_name: "长文双格式分发"
+  short_description: "将 Obsidian 长文导出为 MDNice 和 X Article 富文本"
+  default_prompt: "Use $fenfa-sop to export this Obsidian article for MDNice and X Articles."
