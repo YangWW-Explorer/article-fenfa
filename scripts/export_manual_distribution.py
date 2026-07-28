@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import re
 import sys
 from pathlib import Path
@@ -29,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("input", type=Path, help="Source Markdown file")
     parser.add_argument("--topic", help="Output topic; inferred from input name by default")
+    parser.add_argument("--title", help="Article title to add when the source has no H1")
+    parser.add_argument(
+        "--image-map",
+        type=Path,
+        help="JSON mapping from local image references to HTTPS URLs and alt text",
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -66,6 +73,86 @@ def clean_source(source: str) -> str:
     source = "\n".join(lines)
     source = re.sub(r"\n{3,}", "\n\n", source).strip()
     return source + "\n"
+
+
+def load_image_map(path: Path | None) -> dict[str, dict[str, str]]:
+    if path is None:
+        return {}
+    path = path.expanduser().resolve()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read image map {path}: {error}") from error
+    if not isinstance(raw, dict):
+        raise ValueError("image map root must be a JSON object")
+
+    result: dict[str, dict[str, str]] = {}
+    for key, value in raw.items():
+        if isinstance(value, str):
+            entry = {"url": value, "alt": Path(key).stem}
+        elif isinstance(value, dict):
+            entry = {
+                "url": str(value.get("url", "")).strip(),
+                "alt": str(value.get("alt", "")).strip() or Path(key).stem,
+            }
+        else:
+            raise ValueError(f"image map entry must be a string or object: {key}")
+        parsed = urlparse(entry["url"])
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise ValueError(f"image map URL must be HTTPS: {key}")
+        result[str(key)] = entry
+    return result
+
+
+def mapped_image(
+    target: str, fallback_alt: str, image_map: dict[str, dict[str, str]]
+) -> str | None:
+    entry = image_map.get(target) or image_map.get(Path(target).name)
+    if not entry:
+        return None
+    alt = entry["alt"] or fallback_alt or Path(target).stem
+    return f"![{alt}]({entry['url']})"
+
+
+def apply_image_map(
+    source: str, image_map: dict[str, dict[str, str]]
+) -> str:
+    def replace_obsidian(match: re.Match[str]) -> str:
+        target = match.group(1).strip()
+        alias = (match.group(2) or "").strip()
+        return mapped_image(target, alias, image_map) or match.group(0)
+
+    def replace_markdown(match: re.Match[str]) -> str:
+        alt, target = match.group(1).strip(), match.group(2).strip()
+        parsed = urlparse(target)
+        if parsed.scheme == "https" and parsed.netloc:
+            return match.group(0)
+        return mapped_image(target, alt, image_map) or match.group(0)
+
+    source = OBSIDIAN_IMAGE_RE.sub(replace_obsidian, source)
+    return MARKDOWN_IMAGE_RE.sub(replace_markdown, source)
+
+
+def ensure_title(source: str, title: str | None) -> str:
+    if re.search(r"^#\s+\S", source, flags=re.MULTILINE):
+        return source
+    if not title or not title.strip():
+        raise ValueError("source has no H1; provide --title")
+
+    heading_levels = [
+        len(match.group(1))
+        for match in re.finditer(r"^(#{2,6})\s+\S", source, flags=re.MULTILINE)
+    ]
+    if heading_levels:
+        shift = max(min(heading_levels) - 2, 0)
+        if shift:
+            source = re.sub(
+                r"^(#{2,6})(\s+)",
+                lambda match: "#" * (len(match.group(1)) - shift) + match.group(2),
+                source,
+                flags=re.MULTILINE,
+            )
+    return f"# {title.strip()}\n\n{source.lstrip()}"
 
 
 def validate_images(source: str) -> tuple[list[tuple[str, str]], list[str]]:
@@ -306,7 +393,14 @@ def main() -> int:
         print("ERROR: input must be inside 10_项目/<日期_主题>/", file=sys.stderr)
         return 2
 
-    source = clean_source(input_path.read_text(encoding="utf-8"))
+    try:
+        image_map = load_image_map(args.image_map)
+        source = clean_source(input_path.read_text(encoding="utf-8"))
+        source = apply_image_map(source, image_map)
+        source = ensure_title(source, args.title)
+    except ValueError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
     placeholders = sorted(set(PLACEHOLDER_RE.findall(source)))
     images, image_errors = validate_images(source)
     if placeholders or image_errors:
@@ -315,7 +409,11 @@ def main() -> int:
             print(f"  placeholder: {item}", file=sys.stderr)
         for item in image_errors:
             print(f"  invalid image: {item}", file=sys.stderr)
-        print("Upload local images to an HTTPS image host and update the source first.", file=sys.stderr)
+        print(
+            "Upload every local image to the MDNice image host, then pass the returned "
+            "HTTPS URLs with --image-map.",
+            file=sys.stderr,
+        )
         return 2
 
     try:
